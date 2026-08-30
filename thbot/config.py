@@ -50,7 +50,8 @@ class Settings:
     )
 
     fetch_posts_limit: int = int(os.getenv("FETCH_POSTS_LIMIT", "100"))
-    classify_batch_size: int = int(os.getenv("CLASSIFY_BATCH_SIZE", "25"))
+    # больше батч — меньше LLM-запросов на канал (бережём дневной лимит free-тарифа)
+    classify_batch_size: int = int(os.getenv("CLASSIFY_BATCH_SIZE", "34"))
     cache_ttl_hours: int = int(os.getenv("CACHE_TTL_HOURS", "168"))
     user_daily_limit: int = int(os.getenv("USER_DAILY_LIMIT", "5"))
     db_path: str = os.getenv("DB_PATH", "thbot.db")

@@ -154,6 +154,14 @@ _MODELS_TTL = 1800  # обновляем список раз в 30 минут
 # sticky-модель по типу задачи: первая успешная переиспользуется
 _sticky: dict[str, str | None] = {"fast": None, "strong": None}
 
+# простой общий троттлинг запросов к OpenRouter (free-лимит: 20/мин, 50/день
+# на весь аккаунт; 429 тоже считаются в дневной лимит — поэтому не спамим)
+_rl_next_at: float = 0.0          # не слать запросы раньше этого времени
+_rl_cooldown_until: float = 0.0   # пауза после 429
+_rl_429_count: int = 0
+_MIN_GAP = 4.0                    # минимум секунд между запросами
+_MAX_429 = 5                      # после стольких 429 подряд — мягкий отказ
+
 # запасной список на случай, если API /models недоступен (сетевой сбой)
 _FALLBACK_FREE_MODELS = settings.classifier_models + ["openrouter/free"]
 
@@ -307,12 +315,27 @@ async def _chat_json(
     max_tokens: int = 8192,
 ) -> dict[str, Any]:
     """Вызывает модели по очереди, пока одна не вернёт валидный JSON."""
+    global _rl_next_at, _rl_cooldown_until, _rl_429_count
+
     client = _client()
     errors: list[str] = []
     started = time.monotonic()
+    rf_attempts = 0  # сколько раз пробовали без response_format
 
     for model in models:
         for attempt in range(retries):
+            # 1) общий троттлинг: не чаще одного запроса в _MIN_GAP секунд
+            wait = max(_rl_next_at, _rl_cooldown_until, time.monotonic()) - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _rl_next_at = time.monotonic() + _MIN_GAP
+
+            if _rl_429_count >= _MAX_429:
+                raise RateLimitedError(
+                    "Бесплатный лимит OpenRouter исчерпан в эту минуту/сегодня "
+                    "(много отказов 429). Подождите 2-5 минут и нажмите «🔄 Обновить»."
+                )
+
             try:
                 kwargs: dict[str, Any] = dict(
                     model=model,
@@ -323,9 +346,9 @@ async def _chat_json(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                # response_format принимают не все провайдеры; на первом повторе
-                # пробуем с ним, на втором — без (для openrouter/free не шлём вовсе)
-                if attempt == 0 and model != "openrouter/free":
+                # response_format принимают не все провайдеры/модели; после неудачи
+                # с JSON-режимом повторяем без него (для openrouter/free не шлём вовсе)
+                if rf_attempts == 0 and model != "openrouter/free":
                     kwargs["response_format"] = {"type": "json_object"}
                 # для сильных рассуждающих моделей просим низкое «усилие размышлений»,
                 # чтобы не ждать минутами и не получать пустой content
@@ -337,8 +360,12 @@ async def _chat_json(
                 content = choice.message.content or ""
                 if not content.strip():
                     raise _EmptyResponse(f"пустой content (finish_reason={getattr(choice, 'finish_reason', '?')})")
-                result = _extract_json(content)
-                _sticky[kind] = model  # запомнили рабочую — следующие запросы сразу на неё
+                parsed = _extract_json(content)
+                result = _normalize_json(parsed)
+                # успех: запоминаем рабочую модель и сбрасываем счётчик 429
+                _sticky[kind] = model
+                _rl_429_count = 0
+                _rl_cooldown_until = time.monotonic()  # снимаем паузу
                 log.info(
                     "OpenRouter: модель %s ответила за %.0f c",
                     model, time.monotonic() - started,
@@ -357,12 +384,45 @@ async def _chat_json(
                         _sticky[kind] = None
                     log.info("OpenRouter: %s недоступна (404), следующая", model)
                     break
-                # 429/5xx/таймаут — подождём и повторим/перейдём дальше
-                await asyncio.sleep(6 * (attempt + 1))
+                if status == 429:
+                    # лимит бесплатного пула: это общий лимит на аккаунт,
+                    # перебор моделей не помогает — только пауза
+                    _rl_429_count += 1
+                    pause = min(15 + 10 * _rl_429_count, 60)
+                    _rl_cooldown_until = time.monotonic() + pause
+                    log.info("OpenRouter: 429 (#%d), пауза %d c", _rl_429_count, pause)
+                    rf_attempts += 1  # на повторе без response_format
+                    await asyncio.sleep(pause)
+                    # ту же модель повторим (attempt), она не «плохая» — пул перегружен
+                    continue
+                # прочие сбои (таймаут сети, кривой JSON от модели) — короткая пауза
+                rf_attempts += 1
+                await asyncio.sleep(5 * (attempt + 1))
     raise RuntimeError(
         "Все бесплатные модели сейчас недоступны (перегружены или отключены):\n- "
-        + "\n- ".join(errors)
+        + "\n- ".join(errors[:12])
     )
+
+
+class RateLimitedError(Exception):
+    """Превышен общий free-лимит OpenRouter (429 подряд) — ждём и пробуем позже."""
+
+
+def _normalize_json(parsed: Any) -> dict[str, Any]:
+    """Приводит ответ модели к словарю: маленькие модели иногда возвращают
+    «голый» JSON-массив вместо ожидаемой обёртки."""
+    if isinstance(parsed, list):
+        # [{"id":..,"category":..}, ...] — классификатор без обёртки {"posts": [...]}
+        if parsed and all(isinstance(x, dict) and "id" in x for x in parsed[:3]):
+            return {"posts": parsed}
+        # иной список — заворачиваем как есть
+        return {"items": parsed}
+    if isinstance(parsed, dict):
+        # вложенная обёртка: {"posts": {...}} — не ломаем; оставляем
+        if isinstance(parsed.get("posts"), dict):
+            parsed["posts"] = [parsed["posts"]]
+        return parsed
+    return {"result": parsed}
 
 
 CLASSIFIER_SYSTEM = """Ты — аналитик Telegram-каналов. Тебе дают посты канала (JSON с полями id и text).
