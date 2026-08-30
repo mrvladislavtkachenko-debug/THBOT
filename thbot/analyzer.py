@@ -183,8 +183,8 @@ async def _chat_json(
                 # повтор бессмыслен и жжёт дневной лимит запросов
                 if status == 404:
                     break
-                # 429/5xx/таймаут — подождём и попробуем ещё раз/следующую модель
-                await asyncio.sleep(2 * (attempt + 1))
+                # 429/5xx/таймаут/пустой ответ — ждём дольше и пробуем снова
+                await asyncio.sleep(6 * (attempt + 1))
     raise RuntimeError("Все бесплатные модели сейчас недоступны:\n- " + "\n- ".join(errors))
 
 
@@ -235,8 +235,11 @@ async def classify_posts(
         data = await _chat_json(
             settings.classifier_models,
             CLASSIFIER_SYSTEM,
-            "Посты для классификации:\n" + json.dumps(payload, ensure_ascii=False),
+            "Посты для классификации:\n"
+            + json.dumps(payload, ensure_ascii=False)
+            + "\n/no_think",  # qwen3-модели: отвечать сразу, без «размышлений»
             temperature=0.2,
+            max_tokens=8192,
         )
         for item in data.get("posts", []):
             try:
@@ -327,7 +330,7 @@ async def synthesize(
         SYNTHESIS_SYSTEM,
         json.dumps(user_payload, ensure_ascii=False),
         temperature=0.4,
-        max_tokens=16000,
+        max_tokens=32768,
     )
     data.setdefault("red_flags", [])
     data.setdefault("takeaways", [])

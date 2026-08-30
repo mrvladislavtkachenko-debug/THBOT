@@ -19,16 +19,19 @@ class Settings:
     bot_token: str = os.getenv("BOT_TOKEN", "")
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
 
-    # ВНИМАНИЕ: бесплатные модели OpenRouter постоянно ротируются.
-    # Список актуальных: https://openrouter.ai/models?max_price=0
+    # ВНИМАНИЕ: бесплатные модели OpenRouter постоянно ротируются и иногда
+    # отключаются («unavailable for free»). Список актуальных:
+    # https://openrouter.ai/models?max_price=0
     # 'openrouter/free' в конце — авто-роутер по любой живой бесплатной модели.
     classifier_models: list[str] = field(
         default_factory=lambda: _models(
             "CLASSIFIER_MODELS",
             [
-                "openai/gpt-oss-20b:free",
-                "qwen/qwen3-next-80b-a3b-instruct:free",
-                "google/gemma-4-31b-it:free",
+                "google/gemma-4-26b-a4b-it:free",
+                "qwen/qwen3-coder:free",
+                "nousresearch/hermes-3-llama-3.1-405b:free",
+                "nvidia/nemotron-3-nano-30b-a3b:free",
+                "meta-llama/llama-3.2-3b-instruct:free",
                 "openrouter/free",
             ],
         )
@@ -37,9 +40,10 @@ class Settings:
         default_factory=lambda: _models(
             "SYNTHESIS_MODELS",
             [
-                "openai/gpt-oss-120b:free",
-                "google/gemma-4-31b-it:free",
+                "nvidia/nemotron-3-super-120b-a12b:free",
                 "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "qwen/qwen3-coder:free",
+                "google/gemma-4-26b-a4b-it:free",
                 "openrouter/free",
             ],
         )
