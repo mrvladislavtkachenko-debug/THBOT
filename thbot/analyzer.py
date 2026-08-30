@@ -1,24 +1,33 @@
 """LLM-анализ канала через OpenRouter (только бесплатные модели).
 
 Пайплайн (экономим запросы — у free-ключа ~50 запросов/день):
-1. classify_posts  — посты батчами отправляются дешёвой/свободной модели,
+1. classify_posts  — посты батчами отправляются модели,
    каждый пост получает категорию и оценку полезности 0/1/2;
 2. synthesize      — один запрос сильной модели: метаданные канала,
    агрегаты (считает код) и лучшие посты → структурированная сводка.
 
-Модели перебираются по порядку: если одна отдаёт 429/ошибку — идём к следующей.
+Бесплатные модели OpenRouter постоянно ротируются и отключаются, поэтому
+список НЕ хардкодим: при старте бот сам запрашивает актуальный список
+бесплатных моделей через /api/v1/models, сортирует их по пригодности
+для анализа текста и запоминает первую рабочую («sticky»), чтобы не жечь
+дневной лимит на переборе. Модели перебираются по очереди при сбоях.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import time
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 
 from .config import settings
 from .parser import ChannelData, Post
+
+log = logging.getLogger("thbot")
 
 # ----------------------------- метрики (считает код, не LLM) ----------------
 
@@ -49,22 +58,16 @@ def median(values: list[float]) -> float:
 def compute_metrics(posts: list[Post], classified: dict[int, dict[str, Any]]) -> dict[str, Any]:
     """Чистая арифметика по постам и вердиктам классификатора."""
     n = len(posts) or 1
-    useful = [c for c in classified.values()]
-    useful_weight = sum(
-        max(c.get("usefulness", 0), 0) for c in useful
-    )  # 0/1/2 на пост
+    useful = list(classified.values())
+    useful_weight = sum(max(c.get("usefulness", 0), 0) for c in useful)  # 0/1/2 на пост
     useful_index = round(100 * useful_weight / (2 * n))
 
     ad_ids = {pid for pid, c in classified.items() if c.get("is_ad")}
-    repost_ids = {
-        pid for pid, c in classified.items() if c.get("is_repost")
-    } | {p.id for p in posts if p.is_repost}
+    repost_ids = {pid for pid, c in classified.items() if c.get("is_repost")} | {
+        p.id for p in posts if p.is_repost
+    }
 
-    er_values = [
-        p.reactions_total / p.views
-        for p in posts
-        if p.views and p.views > 0
-    ]
+    er_values = [p.reactions_total / p.views for p in posts if p.views and p.views > 0]
     engagement = median(er_values)
 
     # частота: постов в неделю по диапазону дат
@@ -120,16 +123,137 @@ def rank_posts(
 
 # --------------------------------- LLM-слой --------------------------------
 
+_openai_client: AsyncOpenAI | None = None
+
+
 def _client() -> AsyncOpenAI:
+    global _openai_client
     if not settings.openrouter_api_key:
         raise RuntimeError(
             "Не задан OPENROUTER_API_KEY. Получите бесплатный ключ на "
             "https://openrouter.ai/keys и впишите его в .env"
         )
-    return AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=settings.openrouter_api_key,
-    )
+    if _openai_client is None:
+        # max_retries=0: ретраи контролируем сами (встроенные в SDK бьют пачками
+        # и впустую жгут дневной лимит при 429)
+        _openai_client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=settings.openrouter_api_key,
+            max_retries=0,
+            timeout=120.0,
+        )
+    return _openai_client
+
+
+# ---- динамический список бесплатных моделей ----
+
+_models_cache: list[str] | None = None
+_models_cache_ts: float = 0.0
+_MODELS_TTL = 1800  # обновляем список раз в 30 минут
+_sticky_model: str | None = None  # последняя модель, которая реально ответила
+
+# запасной список на случай, если API /models недоступен (сетевой сбой)
+_FALLBACK_FREE_MODELS = settings.classifier_models + [
+    "openrouter/free",
+]
+
+# модели/семейства, не подходящие для анализа текста постов
+_BAD_KEYWORDS = (
+    "lyria", "safety", "content-safety", "embedding", "tts",
+    "music", "audio", "voice", "speech", "image-gen",
+)
+
+# предпочтительные семейства (по убыванию «силы» для анализа и синтеза)
+_PREFERRED = (
+    "nemotron-3-ultra",
+    "nemotron-3-super",
+    "hermes",
+    "gpt-oss-120",
+    "qwen3-next",
+    "gemma-4-26b",
+    "gemma-4-31b",
+    "qwen3-coder",
+    "gpt-oss-20",
+    "nemotron-3-nano",
+    "llama-3.3",
+    "gemma-3",
+    "llama-3.2",
+    "openrouter/free",
+)
+
+
+async def discover_free_models(limit: int = 9) -> list[str]:
+    """Список живых бесплатных моделей через /api/v1/models.
+
+    Результат кэшируется на 30 минут; первая успешная модель становится
+    «sticky» и пробуется первой во всех последующих запросах (экономия лимита).
+    """
+    global _models_cache, _models_cache_ts, _sticky_model
+
+    now = time.monotonic()
+    models = _models_cache
+    if models is None or now - _models_cache_ts > _MODELS_TTL:
+        models = await _fetch_free_models()
+        _models_cache = models
+        _models_cache_ts = now
+
+    ordered = list(models)
+    if _sticky_model and _sticky_model in ordered:
+        ordered.remove(_sticky_model)
+        ordered.insert(0, _sticky_model)
+
+    # авто-роутер всегда последним шансом
+    if "openrouter/free" not in ordered:
+        ordered.append("openrouter/free")
+    result = ordered[:limit]
+    if "openrouter/free" not in result:
+        result.append("openrouter/free")
+    return result
+
+
+async def _fetch_free_models() -> list[str]:
+    try:
+        async with httpx.AsyncClient(timeout=25) as hc:
+            resp = await hc.get("https://openrouter.ai/api/v1/models")
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+
+        free: list[tuple[str, int]] = []
+        for m in data:
+            mid = m.get("id", "") or ""
+            if not mid:
+                continue
+            pricing = m.get("pricing", {})
+            try:
+                if float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0:
+                    continue  # платная
+            except (TypeError, ValueError):
+                continue
+            arch = m.get("architecture", {})
+            out_mods = arch.get("output_modalities")
+            if out_mods and out_mods != ["text"]:
+                continue  # аудио/музыка и прочий не-текст
+            low = mid.lower()
+            if any(k in low for k in _BAD_KEYWORDS):
+                continue
+            free.append((mid, m.get("context_length", 0) or 0))
+
+        def rank(item: tuple[str, int]) -> tuple[int, int]:
+            mid, ctx = item
+            pref = next((i for i, p in enumerate(_PREFERRED) if p in mid.lower()), len(_PREFERRED))
+            return (pref, -ctx)
+
+        free.sort(key=rank)
+        models = [mid for mid, _ in free]
+        log.info("OpenRouter: живых бесплатных моделей: %d; топ: %s", len(models), models[:6])
+        return models or list(_FALLBACK_FREE_MODELS)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Не удалось получить список моделей OpenRouter (%s) — беру запасной список", exc)
+        return list(_FALLBACK_FREE_MODELS)
+
+
+class _EmptyResponse(Exception):
+    """Модель ответила пустым content (обычно весь лимит токенов ушёл в reasoning)."""
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -152,11 +276,13 @@ async def _chat_json(
     *,
     temperature: float = 0.3,
     retries: int = 2,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
 ) -> dict[str, Any]:
     """Вызывает модели по очереди, пока одна не вернёт валидный JSON."""
+    global _sticky_model
     client = _client()
     errors: list[str] = []
+
     for model in models:
         for attempt in range(retries):
             try:
@@ -169,23 +295,40 @@ async def _chat_json(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                # не все бесплатные модели принимают response_format —
-                # на первом повторе пробуем с ним, на следующих без него
-                if attempt == 0:
+                # response_format принимают не все провайдеры; на первом повторе
+                # пробуем с ним, на втором — без (для openrouter/free не шлём вовсе)
+                if attempt == 0 and model != "openrouter/free":
                     kwargs["response_format"] = {"type": "json_object"}
+
                 resp = await client.chat.completions.create(**kwargs)
-                content = resp.choices[0].message.content or ""
-                return _extract_json(content)
+                choice = resp.choices[0]
+                content = choice.message.content or ""
+                if not content.strip():
+                    finish = getattr(choice, "finish_reason", "?")
+                    raise _EmptyResponse(f"пустой content (finish_reason={finish})")
+                result = _extract_json(content)
+                _sticky_model = model  # запомнили рабочую — следующие запросы сразу на неё
+                log.info("OpenRouter: модель %s ответила успешно", model)
+                return result
+            except _EmptyResponse as exc:
+                errors.append(f"{model}: пустой ответ")
+                log.info("OpenRouter: %s — пустой ответ, пробую следующую модель", model)
+                break  # пустые ответы повторять смысла нет — к следующей модели
             except Exception as exc:  # noqa: BLE001 — разбираем любые сбои API
                 status = getattr(exc, "status_code", None)
                 errors.append(f"{model} (попытка {attempt + 1}): {type(exc).__name__} {exc}")
-                # 404 = модель больше не бесплатна/не существует — сразу к следующей,
-                # повтор бессмыслен и жжёт дневной лимит запросов
                 if status == 404:
+                    # модель больше не бесплатна/не существует — сразу к следующей
+                    if _sticky_model == model:
+                        _sticky_model = None
+                    log.info("OpenRouter: %s недоступна (404), следующая", model)
                     break
-                # 429/5xx/таймаут/пустой ответ — ждём дольше и пробуем снова
+                # 429/5xx/таймаут — подождём и повторим/перейдём дальше
                 await asyncio.sleep(6 * (attempt + 1))
-    raise RuntimeError("Все бесплатные модели сейчас недоступны:\n- " + "\n- ".join(errors))
+    raise RuntimeError(
+        "Все бесплатные модели сейчас недоступны (перегружены или отключены):\n- "
+        + "\n- ".join(errors)
+    )
 
 
 CLASSIFIER_SYSTEM = """Ты — аналитик Telegram-каналов. Тебе дают посты канала (JSON с полями id и text).
@@ -225,15 +368,17 @@ async def classify_posts(
     """Батчами прогоняет посты через классификатор → {post_id: вердикт}."""
     batch_size = batch_size or settings.classify_batch_size
     result: dict[int, dict[str, Any]] = {}
+    models = await discover_free_models()
 
     batches = [posts[i : i + batch_size] for i in range(0, len(posts), batch_size)]
-    for batch in batches:
+    for bi, batch in enumerate(batches, 1):
         payload = [
             {"id": p.id, "text": (p.text or f"[медиа: {p.media_type or 'пост'}]")[:1500]}
             for p in batch
         ]
+        log.info("Классификация батча %d/%d (%d постов)", bi, len(batches), len(batch))
         data = await _chat_json(
-            settings.classifier_models,
+            models,
             CLASSIFIER_SYSTEM,
             "Посты для классификации:\n"
             + json.dumps(payload, ensure_ascii=False)
@@ -325,14 +470,63 @@ async def synthesize(
         "all_useful_post_ids": sorted(top_ids),
     }
 
+    models = await discover_free_models()
     data = await _chat_json(
-        settings.synthesis_models,
+        models,
         SYNTHESIS_SYSTEM,
         json.dumps(user_payload, ensure_ascii=False),
         temperature=0.4,
-        max_tokens=32768,
+        max_tokens=16000,
     )
     data.setdefault("red_flags", [])
     data.setdefault("takeaways", [])
     data.setdefault("best_post_ids", [])
     return data
+
+
+# --------------------------- диагностика (CLI) -------------------------------
+
+async def _main_check() -> None:
+    """python -m thbot.analyzer — показать живые бесплатные модели и проверить их.
+
+    Не использует Telegram и парсинг: только OpenRouter.
+    """
+    models = await discover_free_models(limit=8)
+    print(f"Отобрано {len(models)} бесплатных моделей (по порядку перебора):")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}. {m}")
+    print("\nПроверка реальным запросом (по очереди до первого успеха):")
+
+    client = _client()
+    ok = False
+    for model in models:
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Ответь одним словом: работает."}],
+                max_tokens=50,
+            )
+            text = (resp.choices[0].message.content or "").strip().replace("\n", " ")
+            print(f"  ✅ {model} → {text[:60]!r}")
+            ok = True
+            break
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(exc, "status_code", None)
+            print(f"  ❌ {model} → {type(exc).__name__} (HTTP {status})")
+    if not ok:
+        print(
+            "\nНи одна модель не ответила. Это бывает при перегрузке бесплатного "
+            "пула — подождите 2-5 минут и попробуйте снова. За актуальным списком: "
+            "https://openrouter.ai/models?max_price=0"
+        )
+    else:
+        print("\nСвязь с OpenRouter есть — бот сможет анализировать каналы.")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if not settings.openrouter_api_key:
+        print("OPENROUTER_API_KEY не задан в .env")
+        sys.exit(1)
+    asyncio.run(_main_check())
