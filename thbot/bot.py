@@ -122,13 +122,21 @@ async def _analyze_and_answer(username: str, bot: Bot, chat_id: int, status_id: 
     except parser.PrivateChannelError as exc:
         await status(f"❌ {exc}")
     except analyzer.RateLimitedError as exc:
-        log.warning("OpenRouter лимит: %s", exc)
-        await status(
-            "⏳ Бесплатный лимит ИИ сейчас исчерпан (много отказов 429 от OpenRouter). "
-            "Это общий лимит на минуту/сутки. Подождите 2–5 минут и нажмите «🔄 Обновить» "
-            "или пришлите канал позже — собранные данные по каналу уже подгружены, "
-            "повторный анализ будет быстрее."
-        )
+        log.warning("OpenRouter лимит (daily=%s): %s", exc.daily, exc)
+        if exc.daily:
+            await status(
+                "🌙 Похоже, исчерпан дневной лимит бесплатных запросов OpenRouter "
+                "(50 в сутки на ключе, отказы 429 тоже считаются). Сброс — в 00:00 UTC "
+                "(02:00 ночи по Калининграду). Уже разобранные каналы открываются из кэша "
+                "без лимита. Разовое пополнение OpenRouter на $10 навсегда поднимает лимит "
+                "до 1000 запросов в сутки."
+            )
+        else:
+            await status(
+                "⏳ Бесплатные ИИ-модели сейчас перегружены (отказы 429 от пулов). "
+                "Это временно и не тратит дневной лимит. Подождите 2–5 минут "
+                "и нажмите «🔄 Обновить»."
+            )
     except RuntimeError as exc:
         log.warning("LLM недоступен: %s", exc)
         await status(

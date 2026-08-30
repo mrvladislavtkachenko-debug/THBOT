@@ -162,13 +162,21 @@ _MODELS_TTL = 1800  # обновляем список раз в 30 минут
 # sticky-модель по типу задачи: первая успешная переиспользуется
 _sticky: dict[str, str | None] = {"fast": None, "strong": None}
 
-# простой общий троттлинг запросов к OpenRouter (free-лимит: 20/мин, 50/день
-# на весь аккаунт; 429 тоже считаются в дневной лимит — поэтому не спамим)
-_rl_next_at: float = 0.0          # не слать запросы раньше этого времени
-_rl_cooldown_until: float = 0.0   # пауза после 429
-_rl_429_count: int = 0
-_MIN_GAP = 4.0                    # минимум секунд между запросами
-_MAX_429 = 5                      # после стольких 429 подряд — мягкий отказ
+# простой троттлинг запросов к OpenRouter (free-лимит: 20/мин на аккаунт;
+# 429 тоже считаются — поэтому не спамим и расходим запросы по вендорам)
+_rl_next_at: float = 0.0  # не слать запросы раньше этого времени
+_MIN_GAP = 4.0            # минимум секунд между запросами
+
+# маркеры разных видов 429 в тексте ошибки OpenRouter
+_DAILY_MARKERS = (
+    "per day", "daily limit", "daily request", "free model daily",
+    "add credit", "add credits", "purchase credit", "exceeded the free",
+    "day limit",
+)
+_PROVIDER_MARKERS = (
+    "rate-limited upstream", "upstream_provider", "provider returned error",
+    "provider_error", "temporarily rate-limited",
+)
 
 # запасной список на случай, если API /models недоступен (сетевой сбой)
 _FALLBACK_FREE_MODELS = settings.classifier_models + ["openrouter/free"]
@@ -312,6 +320,35 @@ def _extract_json(text: str) -> dict[str, Any]:
         raise
 
 
+def _vendor(model: str) -> str:
+    """Вендор по id модели: google/gemma-... → 'google', openrouter/free → 'router'."""
+    if model == "openrouter/free":
+        return "router"
+    return model.split("/", 1)[0].lower()
+
+
+def _classify_429(exc: Exception) -> str:
+    """Различает дневной лимит аккаунта и перегрузку пула провайдера.
+
+    → 'daily'  — лимит на ключ (50/день free): перебор моделей бесполезен, ждём сброса;
+      'pool'   — перегружен пул конкретного бесплатного провайдера: идём к другой модели.
+    """
+    text = str(exc).lower()
+    if any(m in text for m in _DAILY_MARKERS):
+        return "daily"
+    if any(m in text for m in _PROVIDER_MARKERS):
+        return "pool"
+    return "unknown"
+
+
+class RateLimitedError(Exception):
+    """Свободный пул перегружен или исчерпан дневной лимит — мягкий отказ."""
+
+    def __init__(self, message: str, *, daily: bool = False):
+        super().__init__(message)
+        self.daily = daily
+
+
 async def _chat_json(
     models: list[str],
     system: str,
@@ -319,30 +356,35 @@ async def _chat_json(
     *,
     kind: str = "fast",
     temperature: float = 0.3,
-    retries: int = 2,
     max_tokens: int = 8192,
+    attempts_per_model: int = 1,
 ) -> dict[str, Any]:
-    """Вызывает модели по очереди, пока одна не вернёт валидный JSON."""
-    global _rl_next_at, _rl_cooldown_until, _rl_429_count
+    """Вызывает модели по очереди, пока одна не вернёт валидный JSON.
+
+    При 429 от пула провайдера — сразу уходим к модели ДРУГОГО вендора
+    (их бесплатные пулы независимы). Длинных пауз и залипания на одной
+    модели не делаем, чтобы не жечь дневной лимит.
+    """
+    global _rl_next_at
 
     client = _client()
     errors: list[str] = []
     started = time.monotonic()
-    rf_attempts = 0  # сколько раз пробовали без response_format
+    tried_vendors: set[str] = set()   # вендоры, у которых уже был сбой на этот вызов
+    pool_429 = 0
+    rf_off = False                    # повтор без response_format после ошибки разбора
 
     for model in models:
-        for attempt in range(retries):
-            # 1) общий троттлинг: не чаще одного запроса в _MIN_GAP секунд
-            wait = max(_rl_next_at, _rl_cooldown_until, time.monotonic()) - time.monotonic()
+        vendor = _vendor(model)
+        if vendor in tried_vendors and vendor != "router":
+            continue                  # этот пул уже ответил сбоем — не дёргаем его снова
+
+        for attempt in range(attempts_per_model):
+            # троттлинг: не чаще одного запроса в _MIN_GAP секунд
+            wait = _rl_next_at - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
             _rl_next_at = time.monotonic() + _MIN_GAP
-
-            if _rl_429_count >= _MAX_429:
-                raise RateLimitedError(
-                    "Бесплатный лимит OpenRouter исчерпан в эту минуту/сегодня "
-                    "(много отказов 429). Подождите 2-5 минут и нажмите «🔄 Обновить»."
-                )
 
             try:
                 kwargs: dict[str, Any] = dict(
@@ -354,12 +396,8 @@ async def _chat_json(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                # response_format принимают не все провайдеры/модели; после неудачи
-                # с JSON-режимом повторяем без него (для openrouter/free не шлём вовсе)
-                if rf_attempts == 0 and model != "openrouter/free":
+                if not rf_off and model != "openrouter/free":
                     kwargs["response_format"] = {"type": "json_object"}
-                # для сильных рассуждающих моделей просим низкое «усилие размышлений»,
-                # чтобы не ждать минутами и не получать пустой content
                 if kind == "strong" and model in _models_reasoning:
                     kwargs["extra_body"] = {"reasoning": {"effort": "low"}}
 
@@ -367,13 +405,11 @@ async def _chat_json(
                 choice = resp.choices[0]
                 content = choice.message.content or ""
                 if not content.strip():
-                    raise _EmptyResponse(f"пустой content (finish_reason={getattr(choice, 'finish_reason', '?')})")
-                parsed = _extract_json(content)
-                result = _normalize_json(parsed)
-                # успех: запоминаем рабочую модель и сбрасываем счётчик 429
+                    raise _EmptyResponse(
+                        f"пустой content (finish_reason={getattr(choice, 'finish_reason', '?')})"
+                    )
+                result = _normalize_json(_extract_json(content))
                 _sticky[kind] = model
-                _rl_429_count = 0
-                _rl_cooldown_until = time.monotonic()  # снимаем паузу
                 log.info(
                     "OpenRouter: модель %s ответила за %.0f c",
                     model, time.monotonic() - started,
@@ -382,38 +418,53 @@ async def _chat_json(
             except _EmptyResponse:
                 errors.append(f"{model}: пустой ответ")
                 log.info("OpenRouter: %s — пустой ответ, следующая модель", model)
-                break  # пустые ответы повторять смысла нет — к следующей модели
+                break  # к следующей модели
             except Exception as exc:  # noqa: BLE001 — разбираем любые сбои API
                 status = getattr(exc, "status_code", None)
-                errors.append(f"{model} (попытка {attempt + 1}): {type(exc).__name__} {exc}")
+                errors.append(f"{model}: {type(exc).__name__} {str(exc)[:160]}")
+
                 if status == 404:
-                    # модель больше не бесплатна/не существует — сразу к следующей
                     if _sticky.get(kind) == model:
                         _sticky[kind] = None
                     log.info("OpenRouter: %s недоступна (404), следующая", model)
+                    tried_vendors.add(vendor)
                     break
                 if status == 429:
-                    # лимит бесплатного пула: это общий лимит на аккаунт,
-                    # перебор моделей не помогает — только пауза
-                    _rl_429_count += 1
-                    pause = min(15 + 10 * _rl_429_count, 60)
-                    _rl_cooldown_until = time.monotonic() + pause
-                    log.info("OpenRouter: 429 (#%d), пауза %d c", _rl_429_count, pause)
-                    rf_attempts += 1  # на повторе без response_format
-                    await asyncio.sleep(pause)
-                    # ту же модель повторим (attempt), она не «плохая» — пул перегружен
-                    continue
-                # прочие сбои (таймаут сети, кривой JSON от модели) — короткая пауза
-                rf_attempts += 1
-                await asyncio.sleep(5 * (attempt + 1))
+                    kind429 = _classify_429(exc)
+                    if kind429 == "daily":
+                        log.warning("OpenRouter: дневной лимит аккаунта исчерпан")
+                        raise RateLimitedError(
+                            "Исчерпан дневной лимит бесплатных запросов OpenRouter "
+                            "(50 запросов/сутки на бесплатном ключе, а сбои тоже считаются). "
+                            "Лимит сбрасывается в 00:00 UTC (02:00 ночи по Калининграду). "
+                            "Повторно открыть канал можно позже, а уже разобранные "
+                            "отдаются из кэша. Надёжно лечится разовым пополнением OpenRouter "
+                            "на $10 — лимит навсегда станет 1000 запросов в сутки.",
+                            daily=True,
+                        )
+                    # перегружен пул провайдера: помечаем вендора и идём к другому
+                    pool_429 += 1
+                    tried_vendors.add(vendor)
+                    log.info("OpenRouter: пул %s перегружен (429), следующий вендор", vendor)
+                    if pool_429 >= 4:
+                        raise RateLimitedError(
+                            "Все бесплатные ИИ-модели сейчас перегружены (429). "
+                            "Это временно и не расходует дневной лимит: подождите 2–5 минут "
+                            "и нажмите «🔄 Обновить».",
+                            daily=False,
+                        )
+                    await asyncio.sleep(3)
+                    break  # к следующей модели (другого вендора)
+                # прочие сбои (таймаут, кривой JSON): ещё одна попытка без response_format
+                rf_off = True
+                tried_vendors.add(vendor)
+                await asyncio.sleep(3)
+                if attempt + 1 >= attempts_per_model:
+                    break
     raise RuntimeError(
-        "Все бесплатные модели сейчас недоступны (перегружены или отключены):\n- "
+        "Не удалось получить ответ ни от одной бесплатной модели:\n- "
         + "\n- ".join(errors[:12])
     )
-
-
-class RateLimitedError(Exception):
-    """Превышен общий free-лимит OpenRouter (429 подряд) — ждём и пробуем позже."""
 
 
 def _normalize_json(parsed: Any) -> dict[str, Any]:
