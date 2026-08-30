@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "THBOT: запустить бота",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "thbot.bot",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "THBOT: проверить парсер",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "thbot.parser",
+      "args": ["molyanov_blog", "--limit", "20"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
