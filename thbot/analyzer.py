@@ -148,14 +148,14 @@ def _client() -> AsyncOpenAI:
 # ---- динамический список бесплатных моделей ----
 
 _models_cache: list[str] | None = None
+_models_reasoning: set[str] = set()  # модели, поддерживающие параметр reasoning
 _models_cache_ts: float = 0.0
 _MODELS_TTL = 1800  # обновляем список раз в 30 минут
-_sticky_model: str | None = None  # последняя модель, которая реально ответила
+# sticky-модель по типу задачи: первая успешная переиспользуется
+_sticky: dict[str, str | None] = {"fast": None, "strong": None}
 
 # запасной список на случай, если API /models недоступен (сетевой сбой)
-_FALLBACK_FREE_MODELS = settings.classifier_models + [
-    "openrouter/free",
-]
+_FALLBACK_FREE_MODELS = settings.classifier_models + ["openrouter/free"]
 
 # модели/семейства, не подходящие для анализа текста постов
 _BAD_KEYWORDS = (
@@ -163,55 +163,84 @@ _BAD_KEYWORDS = (
     "music", "audio", "voice", "speech", "image-gen",
 )
 
-# предпочтительные семейства (по убыванию «силы» для анализа и синтеза)
-_PREFERRED = (
-    "nemotron-3-ultra",
+# Приоритет для КЛАССИФИКАЦИИ: быстрые, лёгкие, не «рассуждающие» модели.
+# Простая разметка постов не требует 550B — монстры тут думают по 3-5 минут.
+_PREFERRED_FAST = (
+    "gemma-4-26b",
+    "gemma-4-31b",
+    "gemma-3-27b",
+    "qwen3-next",
+    "nemotron-3-nano-30b",
+    "gpt-oss-20",
+    "llama-3.3",
+    "llama-3.2",
+    "lfm-2.5",
+    "dolphin",
+    "qwen3-coder",
+    "nemotron-nano-12b",
     "nemotron-3-super",
     "hermes",
     "gpt-oss-120",
+    "nemotron-3-ultra",
+    "openrouter/free",
+)
+
+# Приоритет для СИНТЕЗА: сильные модели, но «супер» раньше «ультры»
+# (ультра 550B на бесплатном пуле отвечает по 5 минут и часто отдаёт пустоту).
+_PREFERRED_STRONG = (
+    "nemotron-3-super",
+    "gpt-oss-120",
+    "hermes",
     "qwen3-next",
-    "gemma-4-26b",
     "gemma-4-31b",
+    "gemma-4-26b",
+    "nemotron-3-nano-30b",
     "qwen3-coder",
-    "gpt-oss-20",
-    "nemotron-3-nano",
+    "nemotron-3-ultra",
     "llama-3.3",
-    "gemma-3",
-    "llama-3.2",
     "openrouter/free",
 )
 
 
-async def discover_free_models(limit: int = 9) -> list[str]:
+async def discover_free_models(kind: str = "fast", limit: int = 8) -> list[str]:
     """Список живых бесплатных моделей через /api/v1/models.
 
-    Результат кэшируется на 30 минут; первая успешная модель становится
-    «sticky» и пробуется первой во всех последующих запросах (экономия лимита).
+    kind='fast'   — для классификации (быстрые модели первыми);
+    kind='strong' — для синтеза (мощные модели первыми).
+    Результат кэшируется на 30 минут; первая успешная модель запоминается
+    («sticky») и пробуется первой в следующих запросах этого типа.
     """
-    global _models_cache, _models_cache_ts, _sticky_model
+    global _models_cache, _models_reasoning, _models_cache_ts
 
     now = time.monotonic()
-    models = _models_cache
-    if models is None or now - _models_cache_ts > _MODELS_TTL:
-        models = await _fetch_free_models()
-        _models_cache = models
+    if _models_cache is None or now - _models_cache_ts > _MODELS_TTL:
+        _models_cache, _models_reasoning = await _fetch_free_models()
         _models_cache_ts = now
 
-    ordered = list(models)
-    if _sticky_model and _sticky_model in ordered:
-        ordered.remove(_sticky_model)
-        ordered.insert(0, _sticky_model)
+    preferred = _PREFERRED_FAST if kind == "fast" else _PREFERRED_STRONG
 
-    # авто-роутер всегда последним шансом
-    if "openrouter/free" not in ordered:
-        ordered.append("openrouter/free")
+    def rank(mid: str) -> tuple[int, int, int]:
+        low = mid.lower()
+        pref = next((i for i, p in enumerate(preferred) if p in low), len(preferred))
+        # рассуждающие/омни-модели в быстрой роли — в самый конец
+        reasoning_penalty = 1 if (kind == "fast" and ("reasoning" in low or "omni" in low)) else 0
+        return (pref, reasoning_penalty, 0)
+
+    ordered = sorted(_models_cache, key=rank)
+
+    sticky = _sticky.get(kind)
+    if sticky and sticky in ordered:
+        ordered.remove(sticky)
+        ordered.insert(0, sticky)
+
     result = ordered[:limit]
     if "openrouter/free" not in result:
         result.append("openrouter/free")
     return result
 
 
-async def _fetch_free_models() -> list[str]:
+async def _fetch_free_models() -> tuple[list[str], set[str]]:
+    """Возвращает (список id бесплатных text→text моделей, множество моделей с reasoning)."""
     try:
         async with httpx.AsyncClient(timeout=25) as hc:
             resp = await hc.get("https://openrouter.ai/api/v1/models")
@@ -219,6 +248,7 @@ async def _fetch_free_models() -> list[str]:
             data = resp.json().get("data", [])
 
         free: list[tuple[str, int]] = []
+        reasoning: set[str] = set()
         for m in data:
             mid = m.get("id", "") or ""
             if not mid:
@@ -233,23 +263,20 @@ async def _fetch_free_models() -> list[str]:
             out_mods = arch.get("output_modalities")
             if out_mods and out_mods != ["text"]:
                 continue  # аудио/музыка и прочий не-текст
-            low = mid.lower()
-            if any(k in low for k in _BAD_KEYWORDS):
+            if any(k in mid.lower() for k in _BAD_KEYWORDS):
                 continue
             free.append((mid, m.get("context_length", 0) or 0))
+            if "reasoning" in (m.get("supported_parameters") or []):
+                reasoning.add(mid)
 
-        def rank(item: tuple[str, int]) -> tuple[int, int]:
-            mid, ctx = item
-            pref = next((i for i, p in enumerate(_PREFERRED) if p in mid.lower()), len(_PREFERRED))
-            return (pref, -ctx)
-
-        free.sort(key=rank)
+        # общая сортировка (контекст как вторичный ключ), точный порядок — в discover
+        free.sort(key=lambda item: -item[1])
         models = [mid for mid, _ in free]
-        log.info("OpenRouter: живых бесплатных моделей: %d; топ: %s", len(models), models[:6])
-        return models or list(_FALLBACK_FREE_MODELS)
+        log.info("OpenRouter: живых бесплатных моделей: %d", len(models))
+        return (models or list(_FALLBACK_FREE_MODELS)), reasoning
     except Exception as exc:  # noqa: BLE001
         log.warning("Не удалось получить список моделей OpenRouter (%s) — беру запасной список", exc)
-        return list(_FALLBACK_FREE_MODELS)
+        return list(_FALLBACK_FREE_MODELS), set()
 
 
 class _EmptyResponse(Exception):
@@ -274,14 +301,15 @@ async def _chat_json(
     system: str,
     user: str,
     *,
+    kind: str = "fast",
     temperature: float = 0.3,
     retries: int = 2,
     max_tokens: int = 8192,
 ) -> dict[str, Any]:
     """Вызывает модели по очереди, пока одна не вернёт валидный JSON."""
-    global _sticky_model
     client = _client()
     errors: list[str] = []
+    started = time.monotonic()
 
     for model in models:
         for attempt in range(retries):
@@ -299,28 +327,34 @@ async def _chat_json(
                 # пробуем с ним, на втором — без (для openrouter/free не шлём вовсе)
                 if attempt == 0 and model != "openrouter/free":
                     kwargs["response_format"] = {"type": "json_object"}
+                # для сильных рассуждающих моделей просим низкое «усилие размышлений»,
+                # чтобы не ждать минутами и не получать пустой content
+                if kind == "strong" and model in _models_reasoning:
+                    kwargs["extra_body"] = {"reasoning": {"effort": "low"}}
 
                 resp = await client.chat.completions.create(**kwargs)
                 choice = resp.choices[0]
                 content = choice.message.content or ""
                 if not content.strip():
-                    finish = getattr(choice, "finish_reason", "?")
-                    raise _EmptyResponse(f"пустой content (finish_reason={finish})")
+                    raise _EmptyResponse(f"пустой content (finish_reason={getattr(choice, 'finish_reason', '?')})")
                 result = _extract_json(content)
-                _sticky_model = model  # запомнили рабочую — следующие запросы сразу на неё
-                log.info("OpenRouter: модель %s ответила успешно", model)
+                _sticky[kind] = model  # запомнили рабочую — следующие запросы сразу на неё
+                log.info(
+                    "OpenRouter: модель %s ответила за %.0f c",
+                    model, time.monotonic() - started,
+                )
                 return result
-            except _EmptyResponse as exc:
+            except _EmptyResponse:
                 errors.append(f"{model}: пустой ответ")
-                log.info("OpenRouter: %s — пустой ответ, пробую следующую модель", model)
+                log.info("OpenRouter: %s — пустой ответ, следующая модель", model)
                 break  # пустые ответы повторять смысла нет — к следующей модели
             except Exception as exc:  # noqa: BLE001 — разбираем любые сбои API
                 status = getattr(exc, "status_code", None)
                 errors.append(f"{model} (попытка {attempt + 1}): {type(exc).__name__} {exc}")
                 if status == 404:
                     # модель больше не бесплатна/не существует — сразу к следующей
-                    if _sticky_model == model:
-                        _sticky_model = None
+                    if _sticky.get(kind) == model:
+                        _sticky[kind] = None
                     log.info("OpenRouter: %s недоступна (404), следующая", model)
                     break
                 # 429/5xx/таймаут — подождём и повторим/перейдём дальше
@@ -368,12 +402,12 @@ async def classify_posts(
     """Батчами прогоняет посты через классификатор → {post_id: вердикт}."""
     batch_size = batch_size or settings.classify_batch_size
     result: dict[int, dict[str, Any]] = {}
-    models = await discover_free_models()
+    models = await discover_free_models("fast")
 
     batches = [posts[i : i + batch_size] for i in range(0, len(posts), batch_size)]
     for bi, batch in enumerate(batches, 1):
         payload = [
-            {"id": p.id, "text": (p.text or f"[медиа: {p.media_type or 'пост'}]")[:1500]}
+            {"id": p.id, "text": (p.text or f"[медиа: {p.media_type or 'пост'}]")[:1000]}
             for p in batch
         ]
         log.info("Классификация батча %d/%d (%d постов)", bi, len(batches), len(batch))
@@ -383,6 +417,7 @@ async def classify_posts(
             "Посты для классификации:\n"
             + json.dumps(payload, ensure_ascii=False)
             + "\n/no_think",  # qwen3-модели: отвечать сразу, без «размышлений»
+            kind="fast",
             temperature=0.2,
             max_tokens=8192,
         )
@@ -470,11 +505,12 @@ async def synthesize(
         "all_useful_post_ids": sorted(top_ids),
     }
 
-    models = await discover_free_models()
+    models = await discover_free_models("strong")
     data = await _chat_json(
         models,
         SYNTHESIS_SYSTEM,
         json.dumps(user_payload, ensure_ascii=False),
+        kind="strong",
         temperature=0.4,
         max_tokens=16000,
     )
@@ -491,8 +527,8 @@ async def _main_check() -> None:
 
     Не использует Telegram и парсинг: только OpenRouter.
     """
-    models = await discover_free_models(limit=8)
-    print(f"Отобрано {len(models)} бесплатных моделей (по порядку перебора):")
+    models = await discover_free_models("fast", limit=8)
+    print(f"Отобрано {len(models)} бесплатных моделей (по порядку перебора для классификации):")
     for i, m in enumerate(models, 1):
         print(f"  {i}. {m}")
     print("\nПроверка реальным запросом (по очереди до первого успеха):")
