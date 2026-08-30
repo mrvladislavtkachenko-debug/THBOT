@@ -103,13 +103,15 @@ async def _analyze_and_answer(username: str, bot: Bot, chat_id: int, status_id: 
         )
 
         messages = report.build_report(channel, metrics, synthesis)
-        # первую часть показываем на месте статус-сообщения
+        # первую часть (карточку) показываем на месте статус-сообщения,
+        # остальные (разбор) шлём следом
         await bot.edit_message_text(
             chat_id=chat_id, message_id=status_id, text=messages[0],
             disable_web_page_preview=True,
         )
         for chunk in messages[1:]:
             await bot.send_message(chat_id, chunk, disable_web_page_preview=True)
+            await asyncio.sleep(0.3)
         await bot.send_message(
             chat_id,
             f"Готово! Отчёт по @{username}. Полезен разбор? 👇",
@@ -203,6 +205,7 @@ def register(dp: Dispatcher) -> None:
                     )
                 else:
                     await message.answer(chunk, disable_web_page_preview=True)
+                    await asyncio.sleep(0.3)
             await message.answer(f"Отчёт по @{username}.", reply_markup=_keyboard(username))
             return
 
