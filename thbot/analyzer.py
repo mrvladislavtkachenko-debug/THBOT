@@ -146,7 +146,13 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 async def _chat_json(
-    models: list[str], system: str, user: str, *, temperature: float = 0.3, retries: int = 2
+    models: list[str],
+    system: str,
+    user: str,
+    *,
+    temperature: float = 0.3,
+    retries: int = 2,
+    max_tokens: int = 4096,
 ) -> dict[str, Any]:
     """Вызывает модели по очереди, пока одна не вернёт валидный JSON."""
     client = _client()
@@ -161,6 +167,7 @@ async def _chat_json(
                         {"role": "user", "content": user},
                     ],
                     temperature=temperature,
+                    max_tokens=max_tokens,
                 )
                 # не все бесплатные модели принимают response_format —
                 # на первом повторе пробуем с ним, на следующих без него
@@ -170,8 +177,13 @@ async def _chat_json(
                 content = resp.choices[0].message.content or ""
                 return _extract_json(content)
             except Exception as exc:  # noqa: BLE001 — разбираем любые сбои API
+                status = getattr(exc, "status_code", None)
                 errors.append(f"{model} (попытка {attempt + 1}): {type(exc).__name__} {exc}")
-                # 429/перегрузка — подождём и попробуем ещё раз/следующую модель
+                # 404 = модель больше не бесплатна/не существует — сразу к следующей,
+                # повтор бессмыслен и жжёт дневной лимит запросов
+                if status == 404:
+                    break
+                # 429/5xx/таймаут — подождём и попробуем ещё раз/следующую модель
                 await asyncio.sleep(2 * (attempt + 1))
     raise RuntimeError("Все бесплатные модели сейчас недоступны:\n- " + "\n- ".join(errors))
 
@@ -315,6 +327,7 @@ async def synthesize(
         SYNTHESIS_SYSTEM,
         json.dumps(user_payload, ensure_ascii=False),
         temperature=0.4,
+        max_tokens=16000,
     )
     data.setdefault("red_flags", [])
     data.setdefault("takeaways", [])
